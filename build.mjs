@@ -59,6 +59,19 @@ const manifestPlugin = {
   setup(b) {
     b.onEnd((result) => {
       if (result.errors.length) return;
+      // Guard: Revenge's Hermes engine rejects async ARROW functions at parse
+      // time ("async functions are unsupported"), which bricks the whole plugin.
+      // async function expressions/methods are fine. Fail the build if an async
+      // arrow slipped into the output so it can never ship silently broken.
+      const out = fs.readFileSync(path.join(OUT_DIR, "index.js"), "utf8");
+      const asyncArrow = /async\s*\([^)]*\)\s*=>|async\s+[A-Za-z_$][\w$]*\s*=>/;
+      if (asyncArrow.test(out)) {
+        throw new Error(
+          "Build blocked: async arrow function found in output. " +
+            "Hermes can't parse `async () => {}` — rewrite it as " +
+            "`async function () {}`."
+        );
+      }
       const hash = writeManifest();
       console.log(`manifest.json written (hash ${hash})`);
     });
@@ -69,7 +82,7 @@ const common = {
   entryPoints: [path.join(__dirname, "src/index.tsx")],
   bundle: true,
   format: "cjs",
-  target: "hermes0.12.0",
+  target: "esnext",
   jsx: "transform",
   jsxFactory: "React.createElement",
   jsxFragment: "React.Fragment",

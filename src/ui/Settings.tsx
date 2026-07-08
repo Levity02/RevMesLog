@@ -141,7 +141,11 @@ export function makeSettings(
     const [report, setReport] = useState<string | null>(null);
     const [running, setRunning] = useState<boolean>(false);
 
-    const run = async () => {
+    // NOTE: async *arrow* functions are unsupported by Revenge's Hermes engine
+    // and cause a parse-time "async functions are unsupported" error that bricks
+    // the whole plugin. Use an async function expression instead (which Hermes
+    // does support). Applies everywhere in this codebase — never `async () =>`.
+    const run = async function () {
       setRunning(true);
       try {
         const d = await a.diagnose();
