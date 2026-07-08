@@ -78,23 +78,55 @@ const manifestPlugin = {
   },
 };
 
+// This loader does NOT provide require() for @vendetta modules — it injects a
+// `vendetta` global (confirmed by inspecting a working plugin's bundle, which
+// accesses vendetta.metro, vendetta.ui.toasts, etc.). So resolve each
+// @vendetta/* import to property access on that global at build time:
+//   import { findByProps } from "@vendetta/metro"  ->  vendetta.metro
+const VENDETTA_MAP = {
+  "@vendetta": "vendetta",
+  "@vendetta/metro": "vendetta.metro",
+  "@vendetta/metro/common": "vendetta.metro.common",
+  "@vendetta/patcher": "vendetta.patcher",
+  "@vendetta/plugin": "vendetta.plugin",
+  "@vendetta/storage": "vendetta.storage",
+  "@vendetta/ui": "vendetta.ui",
+  "@vendetta/ui/toasts": "vendetta.ui.toasts",
+  "@vendetta/ui/components": "vendetta.ui.components",
+  "@vendetta/ui/alerts": "vendetta.ui.alerts",
+  "@vendetta/ui/assets": "vendetta.ui.assets",
+  "@vendetta/commands": "vendetta.commands",
+  "@vendetta/utils": "vendetta.utils",
+};
+
+const vendettaPlugin = {
+  name: "vendetta-globals",
+  setup(b) {
+    b.onResolve({ filter: /^@vendetta(\/|$)/ }, (args) => ({
+      path: args.path,
+      namespace: "vendetta-ns",
+    }));
+    b.onLoad({ filter: /.*/, namespace: "vendetta-ns" }, (args) => {
+      const target = VENDETTA_MAP[args.path] ?? "vendetta";
+      return { contents: `module.exports = ${target};` };
+    });
+  },
+};
+
 const common = {
   entryPoints: [path.join(__dirname, "src/index.tsx")],
   bundle: true,
   format: "cjs",
   // es2021 keeps async/await native (Hermes supports it). Classes are avoided
   // entirely in source (Hermes rejects class expressions), so no class lowering
-  // is needed. Do not raise to esnext — that reintroduces class-field risk if a
-  // class ever creeps back in.
+  // is needed. Do not raise to esnext.
   target: "es2021",
   jsx: "transform",
   jsxFactory: "React.createElement",
   jsxFragment: "React.Fragment",
-  // The client loader provides these at runtime; keep them out of the bundle so
-  // they compile to require("@vendetta/...") calls the loader resolves. This is
-  // the mechanism that let the plugin enable and run onLoad.
-  external: ["@vendetta", "@vendetta/*"],
-  plugins: [manifestPlugin],
+  // vendettaPlugin rewrites @vendetta/* imports to `vendetta.*` global access.
+  // Both plugins in ONE array — a second `plugins:` key would silently drop one.
+  plugins: [manifestPlugin, vendettaPlugin],
   outfile: path.join(OUT_DIR, "index.js"),
   logLevel: "info",
   legalComments: "none",
