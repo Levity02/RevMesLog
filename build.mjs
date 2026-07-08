@@ -91,10 +91,11 @@ const common = {
   jsxFactory: "React.createElement",
   jsxFragment: "React.Fragment",
   // The client loader provides these at runtime; keep them out of the bundle so
-  // they compile to require("@vendetta/...") calls the loader resolves.
+  // they compile to require("@vendetta/...") calls the loader resolves. This is
+  // the mechanism that let the plugin enable and run onLoad.
   external: ["@vendetta", "@vendetta/*"],
-  outfile: path.join(OUT_DIR, "index.js"),
   plugins: [manifestPlugin],
+  outfile: path.join(OUT_DIR, "index.js"),
   logLevel: "info",
   legalComments: "none",
 };

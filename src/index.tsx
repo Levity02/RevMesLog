@@ -55,6 +55,22 @@ const Settings = makeSettings(adapter, loadSettings, saveSettings, openViewer);
 export default {
   onLoad() {
     logger.start();
+    // Diagnostic: surface whether the runtime modules resolved, via channels
+    // that work even if the settings screen doesn't — a toast and the debug log.
+    try {
+      adapter
+        .diagnose()
+        .then((d) => {
+          const summary = d.fileModuleMethods[0] ?? "(no summary)";
+          adapter.ui.showToast(`MLR loaded — ${summary}`);
+          console.log("[MessageLoggerRevenge] diagnose:", JSON.stringify(d));
+        })
+        .catch((e) => {
+          console.log("[MessageLoggerRevenge] diagnose failed:", String(e));
+        });
+    } catch (e) {
+      console.log("[MessageLoggerRevenge] onLoad diagnostic error:", String(e));
+    }
   },
   onUnload() {
     logger.stop();
