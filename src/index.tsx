@@ -48,13 +48,17 @@ const Settings = makeSettings(adapter, loadSettings, saveSettings, openViewer);
 
 // ---- Vendetta lifecycle ----------------------------------------------------
 
-export const onLoad = () => {
-  logger.start();
+// The Revenge/Vendetta loader reads a plugin's DEFAULT export as the instance:
+// an object with onLoad/onUnload (and optional settings). Named exports don't
+// register — the loader finds no instance, which is why the toggle/settings go
+// inert. So everything the client calls lives on this one default-exported object.
+export default {
+  onLoad() {
+    logger.start();
+  },
+  onUnload() {
+    logger.stop();
+  },
+  // Rendered on the plugin's settings page.
+  settings: Settings,
 };
-
-export const onUnload = () => {
-  logger.stop();
-};
-
-// Vendetta renders this in the plugin's settings page.
-export const settings = Settings;
