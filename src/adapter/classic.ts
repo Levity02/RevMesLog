@@ -1,9 +1,16 @@
 /**
  * Revenge Classic / Vendetta implementation of the Adapter contract.
  *
- * This is the ONLY file in the plugin that reads from `vendetta.*` and the
- * native module registry. When porting to Next, clone this file as next.ts and
- * reimplement each member against the new API.
+ * This is the ONLY file that touches the client-mod runtime. Everything here is
+ * resolved LAZILY and DEFENSIVELY:
+ *   - The runtime object is read as `globalThis.vendetta` (a safe property read
+ *     that yields undefined if absent) rather than a bare `vendetta` identifier
+ *     (which throws a ReferenceError at module-eval time and silently bricks the
+ *     whole plugin).
+ *   - Every metro/store/common lookup is deferred until first use and wrapped so
+ *     a missing piece degrades gracefully instead of taking down the plugin.
+ *   - diagnose() reports exactly what resolved, so a broken build is readable
+ *     on-device via the self-check instead of an inert card.
  */
 
 import type {
@@ -19,37 +26,75 @@ import type {
   RawMessage,
 } from "./types";
 
-// Vendetta globals are injected at runtime; declare loosely.
-declare const vendetta: any;
+// ---- safe, memoized resolution of the runtime ------------------------------
 
-const {
-  metro: { findByStoreName, findByProps, common },
-  patcher,
-  storage,
-  ui,
-} = vendetta;
+function lazy<T>(fn: () => T): () => T {
+  let cached: T;
+  let done = false;
+  return () => {
+    if (!done) {
+      try {
+        cached = fn();
+      } catch {
+        cached = undefined as unknown as T;
+      }
+      done = true;
+    }
+    return cached;
+  };
+}
 
-const { React, ReactNative } = common;
-const { FluxDispatcher, Constants } = common;
+// Read the runtime object without risking a ReferenceError.
+const V = lazy<any>(() => (globalThis as any).vendetta);
 
-// Native FileModule — same bridge Revenge uses for its own loader config.
-const FileModule =
-  findByProps("writeFile", "fileExists", "readFile") ??
-  findByProps("writeFile", "readFile");
+const metro = lazy<any>(() => V()?.metro);
+const common = lazy<any>(() => metro()?.common);
+const patcherMod = lazy<any>(() => V()?.patcher);
+// Plugin storage lives under different names across forks; try the known ones.
+const storageMod = lazy<any>(() => V()?.storage ?? V()?.plugin?.storage);
+const uiMod = lazy<any>(() => V()?.ui);
 
-const PLUGIN_DIR = "MessageLoggerRevenge";
-// Vendetta's file APIs are rooted at the app documents dir; we namespace under it.
-const ROOT = `${PLUGIN_DIR}/`;
+const findByProps = (...names: string[]): any => {
+  try {
+    return metro()?.findByProps?.(...names);
+  } catch {
+    return undefined;
+  }
+};
+const findByStoreName = (name: string): any => {
+  try {
+    return metro()?.findByStoreName?.(name);
+  } catch {
+    return undefined;
+  }
+};
+
+const MessageStore = lazy<any>(() => findByStoreName("MessageStore"));
+const ChannelStore = lazy<any>(() => findByStoreName("ChannelStore"));
+const FluxDispatcher = lazy<any>(
+  () => common()?.FluxDispatcher ?? findByProps("dispatch", "subscribe")
+);
+const ReactRef = lazy<any>(() => common()?.React);
+const ReactNativeRef = lazy<any>(() => common()?.ReactNative);
+
+// Native file module — names vary across builds; probe several shapes.
+const FileModule = lazy<any>(
+  () =>
+    findByProps("writeFile", "fileExists", "readFile") ??
+    findByProps("writeFile", "readFile") ??
+    findByProps("readFile", "writeFile") ??
+    findByProps("writeFile")
+);
+
+const BUCKET = "documents";
+const ROOT = "MessageLoggerRevenge/";
 
 // ---- Stores ----------------------------------------------------------------
-
-const MessageStore = findByStoreName("MessageStore");
-const ChannelStore = findByStoreName("ChannelStore");
 
 const stores: Stores = {
   getMessage(channelId, messageId) {
     try {
-      const m = MessageStore.getMessage(channelId, messageId);
+      const m = MessageStore()?.getMessage?.(channelId, messageId);
       return m ? (m.toJS ? m.toJS() : m) : undefined;
     } catch {
       return undefined;
@@ -57,7 +102,7 @@ const stores: Stores = {
   },
   getChannelGuildId(channelId) {
     try {
-      return ChannelStore.getChannel(channelId)?.guild_id ?? undefined;
+      return ChannelStore()?.getChannel?.(channelId)?.guild_id ?? undefined;
     } catch {
       return undefined;
     }
@@ -66,70 +111,90 @@ const stores: Stores = {
 
 // ---- Files -----------------------------------------------------------------
 
-// "documents" is the storage bucket constant FileModule expects on Android.
-const BUCKET = "documents";
-
 const files: FileIO = {
   root: () => ROOT,
   async exists(path) {
     try {
-      return await FileModule.fileExists(`${BUCKET}/${path}`);
+      return await FileModule()?.fileExists?.(`${BUCKET}/${path}`);
     } catch {
       return false;
     }
   },
   async readText(path) {
     try {
-      return await FileModule.readFile(`${BUCKET}/${path}`, "utf8");
+      return await FileModule()?.readFile?.(`${BUCKET}/${path}`, "utf8");
     } catch {
       return null;
     }
   },
   async writeText(path, data) {
-    await FileModule.writeFile(BUCKET, path, data, "utf8");
+    await FileModule()?.writeFile?.(BUCKET, path, data, "utf8");
   },
   async readBinaryBase64(path) {
     try {
-      return await FileModule.readFile(`${BUCKET}/${path}`, "base64");
+      return await FileModule()?.readFile?.(`${BUCKET}/${path}`, "base64");
     } catch {
       return null;
     }
   },
   async writeBinaryBase64(path, base64) {
-    // base64 through the bridge avoids UTF-8 mangling of binary data.
-    await FileModule.writeFile(BUCKET, path, base64, "base64");
+    await FileModule()?.writeFile?.(BUCKET, path, base64, "base64");
   },
   async delete(path) {
     try {
-      await FileModule.removeFile?.(BUCKET, path);
+      await FileModule()?.removeFile?.(BUCKET, path);
     } catch {
       /* best-effort */
     }
   },
   async mkdirp(path) {
-    // Most FileModule impls create parent dirs on write; this is a no-op guard.
     try {
-      await FileModule.createDirectory?.(BUCKET, path);
+      await FileModule()?.createDirectory?.(BUCKET, path);
     } catch {
       /* ignore */
     }
   },
   toImageUri(path) {
-    // FileModule exposes the documents dir path; RN can load file:// from it.
-    const base = FileModule.getConstants?.().DocumentsDirPath ?? "";
+    let base = "";
+    try {
+      base = FileModule()?.getConstants?.().DocumentsDirPath ?? "";
+    } catch {
+      base = "";
+    }
     return `file://${base}/${path}`;
   },
 };
 
-// ---- KV (Vendetta storage proxy: auto-persisted JSON) ----------------------
+// ---- KV (Vendetta storage proxy, with in-memory fallback) ------------------
+
+// If the storage proxy isn't available, fall back to a session-only object so
+// the plugin still runs (it just won't persist until we wire storage correctly).
+const memKV: Record<string, unknown> = {};
 
 const kv: KV = {
   get(key, fallback) {
-    const v = storage[key];
-    return v === undefined ? fallback : v;
+    try {
+      const s = storageMod();
+      if (s) {
+        const v = s[key];
+        return v === undefined ? fallback : v;
+      }
+    } catch {
+      /* fall through to memory */
+    }
+    return (memKV[key] as any) ?? fallback;
   },
   set(key, value) {
-    storage[key] = value;
+    try {
+      const s = storageMod();
+      if (s) {
+        s[key] = value;
+        return;
+      }
+    } catch {
+      /* fall through to memory */
+    }
+    memKV[key] = value;
   },
 };
 
@@ -137,12 +202,18 @@ const kv: KV = {
 
 const patch: Patcher = {
   onDispatch(handler) {
-    // `before` lets us inspect and optionally cancel by returning [].
-    return patcher.before("dispatch", FluxDispatcher, (args: any[]) => {
-      const action = args[0];
-      const result = handler(action);
-      if (result === false) return []; // swallow: replace args with empty
-    });
+    try {
+      const p = patcherMod();
+      const fd = FluxDispatcher();
+      if (!p?.before || !fd) return () => {};
+      return p.before("dispatch", fd, (args: any[]) => {
+        const action = args[0];
+        const result = handler(action);
+        if (result === false) return [];
+      });
+    } catch {
+      return () => {};
+    }
   },
 };
 
@@ -164,7 +235,6 @@ const net: Net = {
           bytes.subarray(i, i + chunk) as unknown as number[]
         );
       }
-      // btoa is available in the Hermes/RN runtime via polyfill.
       const base64 = (globalThis as any).btoa(binary);
       return { base64, contentType };
     } catch {
@@ -175,12 +245,18 @@ const net: Net = {
 
 // ---- UI --------------------------------------------------------------------
 
+// Getters so destructuring in the UI factories resolves at call time (by which
+// point the runtime is initialized), not at module-eval time.
 const uiToolkit: UIToolkit = {
-  React,
-  ReactNative,
+  get React() {
+    return ReactRef();
+  },
+  get ReactNative() {
+    return ReactNativeRef();
+  },
   showToast(msg) {
     try {
-      ui.toasts.showToast(msg);
+      uiMod()?.toasts?.showToast?.(msg);
     } catch {
       /* toasts optional */
     }
@@ -189,36 +265,38 @@ const uiToolkit: UIToolkit = {
 
 // ---- Navigation ------------------------------------------------------------
 
-// Resolve navigation helpers once. Names drift across builds, so we probe a
-// few known shapes and fall back gracefully.
-const Navigation = findByProps("push", "pushLazy") ?? findByProps("push", "pop");
-const Router =
-  findByProps("transitionToGuild") ??
-  findByProps("transitionTo") ??
-  findByProps("openChannel");
+const navHelper = lazy<any>(
+  () => findByProps("push", "pushLazy") ?? findByProps("push", "pop")
+);
+const router = lazy<any>(
+  () =>
+    findByProps("transitionToGuild") ??
+    findByProps("transitionTo") ??
+    findByProps("openChannel")
+);
 
 const nav: Nav = {
   pushScreen(title, component) {
     try {
-      Navigation?.push?.(component, { title, headerTitle: title });
+      navHelper()?.push?.(component, { title, headerTitle: title });
     } catch {
       uiToolkit.showToast("Couldn't open screen — see diagnostics");
     }
   },
   jumpToMessage(channelId, messageId, guildId) {
     try {
-      if (Router?.transitionToGuild) {
-        // guildId "@me" for DMs; Discord accepts the literal for DM channels.
-        Router.transitionToGuild(guildId ?? "@me", channelId, messageId);
+      const r = router();
+      if (r?.transitionToGuild) {
+        r.transitionToGuild(guildId ?? "@me", channelId, messageId);
         return;
       }
-      if (Router?.transitionTo) {
+      if (r?.transitionTo) {
         const base = `/channels/${guildId ?? "@me"}/${channelId}`;
-        Router.transitionTo(messageId ? `${base}/${messageId}` : base);
+        r.transitionTo(messageId ? `${base}/${messageId}` : base);
         return;
       }
-      if (Router?.openChannel) {
-        Router.openChannel({ channelId, messageId });
+      if (r?.openChannel) {
+        r.openChannel({ channelId, messageId });
         return;
       }
       uiToolkit.showToast("No navigation route available");
@@ -231,15 +309,32 @@ const nav: Nav = {
 // ---- Diagnostics -----------------------------------------------------------
 
 async function diagnose(): Promise<Diagnostics> {
+  const vendettaKeys = (() => {
+    try {
+      const v = V();
+      return v ? Object.keys(v) : [];
+    } catch {
+      return [];
+    }
+  })();
+
   const fileModuleMethods = (() => {
     try {
+      const fm = FileModule();
+      if (!fm) return [];
       const keys = new Set<string>();
-      let obj = FileModule;
+      let obj: any = fm;
       while (obj && obj !== Object.prototype) {
         for (const k of Object.getOwnPropertyNames(obj)) keys.add(k);
         obj = Object.getPrototypeOf(obj);
       }
-      return [...keys].filter((k) => typeof (FileModule as any)[k] === "function").sort();
+      return [...keys].filter((k) => {
+        try {
+          return typeof fm[k] === "function";
+        } catch {
+          return false;
+        }
+      }).sort();
     } catch {
       return [];
     }
@@ -247,13 +342,12 @@ async function diagnose(): Promise<Diagnostics> {
 
   const documentsDir = (() => {
     try {
-      return FileModule.getConstants?.().DocumentsDirPath ?? null;
+      return FileModule()?.getConstants?.().DocumentsDirPath ?? null;
     } catch {
       return null;
     }
   })();
 
-  // Round-trip a tiny file to confirm the write/read path names are right.
   let fileRoundTripOK: boolean | null = null;
   try {
     const probe = `${ROOT}.probe`;
@@ -267,10 +361,15 @@ async function diagnose(): Promise<Diagnostics> {
 
   return {
     platform: "revenge-classic",
-    fileModuleMethods,
+    // Reuse fileModuleMethods to also carry the vendetta-global summary in the
+    // first entry, so the self-check surfaces whether the runtime was found.
+    fileModuleMethods:
+      vendettaKeys.length > 0
+        ? [`vendetta global keys: ${vendettaKeys.join(", ")}`, ...fileModuleMethods]
+        : ["vendetta global: NOT FOUND", ...fileModuleMethods],
     documentsDir,
-    storesResolved: { message: !!MessageStore, channel: !!ChannelStore },
-    navResolved: !!(Navigation?.push),
+    storesResolved: { message: !!MessageStore(), channel: !!ChannelStore() },
+    navResolved: !!navHelper()?.push,
     fileRoundTripOK,
   };
 }
