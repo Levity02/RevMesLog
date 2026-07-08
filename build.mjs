@@ -82,7 +82,11 @@ const common = {
   entryPoints: [path.join(__dirname, "src/index.tsx")],
   bundle: true,
   format: "cjs",
-  target: "esnext",
+  // es2021 (not esnext): Hermes rejects es2022 class fields ("invalid
+  // expression"). es2021 lowers class fields to constructor assignments while
+  // KEEPING async/await (es2017) and logical assignment (es2021), both of which
+  // Hermes supports. Do not raise this to esnext.
+  target: "es2021",
   jsx: "transform",
   jsxFactory: "React.createElement",
   jsxFragment: "React.Fragment",
