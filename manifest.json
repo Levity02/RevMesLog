@@ -1,0 +1,12 @@
+{
+  "name": "MessageLoggerRevenge",
+  "description": "Persistent deleted/edited message logging with a browsable log UI and local attachment caching. Port of MessageLoggerV2.",
+  "authors": [
+    { "name": "Levity02", "id": "0" }
+  ],
+  "main": "dist/index.js",
+  "vendetta": {
+    "icon": "ic_message_retention"
+  },
+  "version": "0.1.0"
+}

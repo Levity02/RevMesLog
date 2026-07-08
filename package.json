@@ -1,0 +1,16 @@
+{
+  "name": "message-logger-revenge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "serve": "node build.mjs --serve",
+    "deploy": "npm run build && gh-pages -d dist -b gh-pages"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.0",
+    "gh-pages": "^6.1.1",
+    "typescript": "^5.4.0"
+  }
+}
