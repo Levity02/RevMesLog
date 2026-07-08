@@ -1,17 +1,21 @@
 /**
  * Revenge Classic / Vendetta implementation of the Adapter contract.
  *
- * This is the ONLY file that touches the client-mod runtime. Everything here is
- * resolved LAZILY and DEFENSIVELY:
- *   - The runtime object is read as `globalThis.vendetta` (a safe property read
- *     that yields undefined if absent) rather than a bare `vendetta` identifier
- *     (which throws a ReferenceError at module-eval time and silently bricks the
- *     whole plugin).
- *   - Every metro/store/common lookup is deferred until first use and wrapped so
- *     a missing piece degrades gracefully instead of taking down the plugin.
- *   - diagnose() reports exactly what resolved, so a broken build is readable
- *     on-device via the self-check instead of an inert card.
+ * The runtime API is provided by the client loader as EXTERNAL modules
+ * (@vendetta/*), resolved via require() at load time — NOT as a globalThis
+ * property. That's the proven mechanism every working plugin uses. The build
+ * marks these external so they compile to require("@vendetta/...") calls.
+ *
+ * Metro *lookups* (findByProps/findByStoreName results) can still legitimately
+ * be undefined on a given build, so those stay lazy + guarded; diagnose()
+ * reports what resolved so the self-check is meaningful on-device.
  */
+
+import { findByProps, findByStoreName } from "@vendetta/metro";
+import { React, ReactNative, FluxDispatcher } from "@vendetta/metro/common";
+import { before } from "@vendetta/patcher";
+import { storage } from "@vendetta/plugin";
+import { showToast } from "@vendetta/ui/toasts";
 
 import type {
   Adapter,
@@ -26,7 +30,7 @@ import type {
   RawMessage,
 } from "./types";
 
-// ---- safe, memoized resolution of the runtime ------------------------------
+// ---- lazy metro lookups ----------------------------------------------------
 
 function lazy<T>(fn: () => T): () => T {
   let cached: T;
@@ -44,40 +48,10 @@ function lazy<T>(fn: () => T): () => T {
   };
 }
 
-// Read the runtime object without risking a ReferenceError.
-const V = lazy<any>(() => (globalThis as any).vendetta);
-
-const metro = lazy<any>(() => V()?.metro);
-const common = lazy<any>(() => metro()?.common);
-const patcherMod = lazy<any>(() => V()?.patcher);
-// Plugin storage lives under different names across forks; try the known ones.
-const storageMod = lazy<any>(() => V()?.storage ?? V()?.plugin?.storage);
-const uiMod = lazy<any>(() => V()?.ui);
-
-const findByProps = (...names: string[]): any => {
-  try {
-    return metro()?.findByProps?.(...names);
-  } catch {
-    return undefined;
-  }
-};
-const findByStoreName = (name: string): any => {
-  try {
-    return metro()?.findByStoreName?.(name);
-  } catch {
-    return undefined;
-  }
-};
-
 const MessageStore = lazy<any>(() => findByStoreName("MessageStore"));
 const ChannelStore = lazy<any>(() => findByStoreName("ChannelStore"));
-const FluxDispatcher = lazy<any>(
-  () => common()?.FluxDispatcher ?? findByProps("dispatch", "subscribe")
-);
-const ReactRef = lazy<any>(() => common()?.React);
-const ReactNativeRef = lazy<any>(() => common()?.ReactNative);
 
-// Native file module — names vary across builds; probe several shapes.
+// Native file module — method names vary across builds; probe several shapes.
 const FileModule = lazy<any>(
   () =>
     findByProps("writeFile", "fileExists", "readFile") ??
@@ -165,34 +139,30 @@ const files: FileIO = {
   },
 };
 
-// ---- KV (Vendetta storage proxy, with in-memory fallback) ------------------
+// ---- KV (plugin storage proxy, with in-memory fallback) --------------------
 
-// If the storage proxy isn't available, fall back to a session-only object so
-// the plugin still runs (it just won't persist until we wire storage correctly).
 const memKV: Record<string, unknown> = {};
 
 const kv: KV = {
   get(key, fallback) {
     try {
-      const s = storageMod();
-      if (s) {
-        const v = s[key];
+      if (storage) {
+        const v = storage[key];
         return v === undefined ? fallback : v;
       }
     } catch {
-      /* fall through to memory */
+      /* fall through */
     }
     return (memKV[key] as any) ?? fallback;
   },
   set(key, value) {
     try {
-      const s = storageMod();
-      if (s) {
-        s[key] = value;
+      if (storage) {
+        storage[key] = value;
         return;
       }
     } catch {
-      /* fall through to memory */
+      /* fall through */
     }
     memKV[key] = value;
   },
@@ -203,10 +173,8 @@ const kv: KV = {
 const patch: Patcher = {
   onDispatch(handler) {
     try {
-      const p = patcherMod();
-      const fd = FluxDispatcher();
-      if (!p?.before || !fd) return () => {};
-      return p.before("dispatch", fd, (args: any[]) => {
+      if (!before || !FluxDispatcher) return () => {};
+      return before("dispatch", FluxDispatcher, (args: any[]) => {
         const action = args[0];
         const result = handler(action);
         if (result === false) return [];
@@ -245,18 +213,12 @@ const net: Net = {
 
 // ---- UI --------------------------------------------------------------------
 
-// Getters so destructuring in the UI factories resolves at call time (by which
-// point the runtime is initialized), not at module-eval time.
 const uiToolkit: UIToolkit = {
-  get React() {
-    return ReactRef();
-  },
-  get ReactNative() {
-    return ReactNativeRef();
-  },
+  React,
+  ReactNative,
   showToast(msg) {
     try {
-      uiMod()?.toasts?.showToast?.(msg);
+      showToast?.(msg);
     } catch {
       /* toasts optional */
     }
@@ -309,34 +271,27 @@ const nav: Nav = {
 // ---- Diagnostics -----------------------------------------------------------
 
 async function diagnose(): Promise<Diagnostics> {
-  const vendettaKeys = (() => {
-    try {
-      const v = V();
-      return v ? Object.keys(v) : [];
-    } catch {
-      return [];
-    }
-  })();
-
   const fileModuleMethods = (() => {
     try {
       const fm = FileModule();
-      if (!fm) return [];
+      if (!fm) return ["FileModule: NOT FOUND"];
       const keys = new Set<string>();
       let obj: any = fm;
       while (obj && obj !== Object.prototype) {
         for (const k of Object.getOwnPropertyNames(obj)) keys.add(k);
         obj = Object.getPrototypeOf(obj);
       }
-      return [...keys].filter((k) => {
-        try {
-          return typeof fm[k] === "function";
-        } catch {
-          return false;
-        }
-      }).sort();
+      return [...keys]
+        .filter((k) => {
+          try {
+            return typeof fm[k] === "function";
+          } catch {
+            return false;
+          }
+        })
+        .sort();
     } catch {
-      return [];
+      return ["FileModule: error"];
     }
   })();
 
@@ -359,14 +314,17 @@ async function diagnose(): Promise<Diagnostics> {
     fileRoundTripOK = false;
   }
 
+  const runtimeSummary = [
+    `React: ${!!React}`,
+    `ReactNative: ${!!ReactNative}`,
+    `FluxDispatcher: ${!!FluxDispatcher}`,
+    `patcher.before: ${!!before}`,
+    `storage: ${!!storage}`,
+  ].join("  ");
+
   return {
     platform: "revenge-classic",
-    // Reuse fileModuleMethods to also carry the vendetta-global summary in the
-    // first entry, so the self-check surfaces whether the runtime was found.
-    fileModuleMethods:
-      vendettaKeys.length > 0
-        ? [`vendetta global keys: ${vendettaKeys.join(", ")}`, ...fileModuleMethods]
-        : ["vendetta global: NOT FOUND", ...fileModuleMethods],
+    fileModuleMethods: [runtimeSummary, ...fileModuleMethods],
     documentsDir,
     storesResolved: { message: !!MessageStore(), channel: !!ChannelStore() },
     navResolved: !!navHelper()?.push,

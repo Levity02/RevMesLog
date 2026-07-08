@@ -13,7 +13,8 @@ export function makeSettings(
   openViewer: () => void
 ) {
   const { React, ReactNative } = a.ui;
-  const { View, Text, Switch, Pressable, TextInput, ScrollView } = ReactNative;
+  const RN = ReactNative ?? {};
+  const { View, Text, Switch, Pressable, TextInput, ScrollView } = RN;
   const useState = React.useState as <S>(
     init: S | (() => S)
   ) => [S, (v: S | ((p: S) => S)) => void];

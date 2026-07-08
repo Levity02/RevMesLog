@@ -18,7 +18,10 @@ export function makeLogViewer(
   cache: AttachmentCache
 ) {
   const { React, ReactNative } = a.ui;
-  const { View, Text, Pressable, FlatList, Image, TextInput } = ReactNative;
+  // Guard: if the runtime didn't provide RN, don't throw at load — degrade so
+  // the plugin still enables and the self-check can report what's missing.
+  const RN = ReactNative ?? {};
+  const { View, Text, Pressable, FlatList, Image, TextInput } = RN;
   // React arrives via the adapter as `any`; give the hooks real signatures.
   const useState = React.useState as <S>(
     init: S | (() => S)

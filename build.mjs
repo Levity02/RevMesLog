@@ -73,6 +73,9 @@ const common = {
   jsx: "transform",
   jsxFactory: "React.createElement",
   jsxFragment: "React.Fragment",
+  // The client loader provides these at runtime; keep them out of the bundle so
+  // they compile to require("@vendetta/...") calls the loader resolves.
+  external: ["@vendetta", "@vendetta/*"],
   outfile: path.join(OUT_DIR, "index.js"),
   plugins: [manifestPlugin],
   logLevel: "info",
