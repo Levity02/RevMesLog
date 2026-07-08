@@ -69,7 +69,7 @@ const common = {
   entryPoints: [path.join(__dirname, "src/index.tsx")],
   bundle: true,
   format: "cjs",
-  target: "esnext",
+  target: "hermes0.12.0",
   jsx: "transform",
   jsxFactory: "React.createElement",
   jsxFragment: "React.Fragment",
