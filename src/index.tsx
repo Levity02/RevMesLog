@@ -7,9 +7,9 @@
  */
 
 import { adapter } from "./adapter/classic";
-import { Logger, LoggerSettings } from "./core/logger";
-import { LogStore } from "./core/store";
-import { AttachmentCache } from "./core/cache";
+import { createLogger, LoggerSettings } from "./core/logger";
+import { createLogStore } from "./core/store";
+import { createAttachmentCache } from "./core/cache";
 import { makeLogViewer } from "./ui/LogViewer";
 import { makeSettings } from "./ui/Settings";
 
@@ -25,8 +25,8 @@ const DEFAULT_SETTINGS: LoggerSettings = {
 
 // ---- wiring ----------------------------------------------------------------
 
-const store = new LogStore(adapter);
-const cache = new AttachmentCache(adapter, {
+const store = createLogStore(adapter);
+const cache = createAttachmentCache(adapter, {
   maxBytes: 512 * 1024 * 1024, // 512 MB LRU ceiling; tune per device
   maxFileBytes: 64 * 1024 * 1024, // skip anything over 64 MB
 });
@@ -39,7 +39,7 @@ function saveSettings(s: LoggerSettings) {
   logger.updateSettings(s);
 }
 
-const logger = new Logger(adapter, store, cache, loadSettings());
+const logger = createLogger(adapter, store, cache, loadSettings());
 
 const LogViewer = makeLogViewer(adapter, store, cache);
 const openViewer = () => adapter.nav.pushScreen("Message Log", LogViewer);

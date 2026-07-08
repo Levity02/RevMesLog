@@ -1,6 +1,8 @@
 /**
  * The logging brain. Wires dispatcher events -> store + cache.
  * Pure orchestration over the Adapter interface; no Discord/RN imports.
+ *
+ * Factory (not a class): Hermes rejects class expressions.
  */
 
 import type { Adapter, RawMessage } from "../adapter/types";
@@ -18,72 +20,33 @@ export interface LoggerSettings {
   cacheAttachments: boolean;
 }
 
-export class Logger {
-  private a: Adapter;
-  private store: LogStore;
-  private cache: AttachmentCache;
-  private settings: LoggerSettings;
-  private unpatch: (() => void) | null = null;
+export interface Logger {
+  start(): void;
+  stop(): void;
+  updateSettings(s: LoggerSettings): void;
+}
 
-  constructor(
-    adapter: Adapter,
-    store: LogStore,
-    cache: AttachmentCache,
-    settings: LoggerSettings
-  ) {
-    this.a = adapter;
-    this.store = store;
-    this.cache = cache;
-    this.settings = settings;
-  }
+export function createLogger(
+  a: Adapter,
+  store: LogStore,
+  cache: AttachmentCache,
+  initialSettings: LoggerSettings
+): Logger {
+  let settings = initialSettings;
+  let unpatch: (() => void) | null = null;
 
-  start() {
-    this.unpatch = this.a.patcher.onDispatch((action) => {
-      const p = this.a.normalize(action);
-      if (!p) return;
-      switch (p.type) {
-        case "MESSAGE_DELETE":
-          this.onDelete(p.channelId, p.id, p.guildId);
-          // Swallow the event to keep the message in-chat if configured.
-          if (this.settings.keepInChat && this.settings.logDeletes) return false;
-          break;
-        case "MESSAGE_DELETE_BULK":
-          for (const id of p.ids) this.onDelete(p.channelId, id, p.guildId);
-          if (this.settings.keepInChat && this.settings.logDeletes) return false;
-          break;
-        case "MESSAGE_UPDATE":
-          this.onUpdate(p.message);
-          break;
-        case "MESSAGE_CREATE":
-          this.onCreate(p.message, p.channelId);
-          break;
-      }
-    });
-  }
-
-  stop() {
-    this.unpatch?.();
-    this.unpatch = null;
-    // Best-effort final flush so nothing buffered is lost on unload.
-    this.store.flush();
-  }
-
-  updateSettings(s: LoggerSettings) {
-    this.settings = s;
-  }
-
-  private authorName(m?: RawMessage): string | undefined {
+  function authorName(m?: RawMessage): string | undefined {
     return m?.author?.global_name ?? m?.author?.username;
   }
 
-  private async onDelete(channelId: string, messageId: string, guildId?: string) {
-    if (!this.settings.logDeletes) return;
-    const msg = this.a.stores.getMessage(channelId, messageId);
+  async function onDelete(channelId: string, messageId: string, guildId?: string) {
+    if (!settings.logDeletes) return;
+    const msg = a.stores.getMessage(channelId, messageId);
     if (!msg) return; // not in client cache; nothing to preserve
 
-    const gid = guildId ?? this.a.stores.getChannelGuildId(channelId);
+    const gid = guildId ?? a.stores.getChannelGuildId(channelId);
     const attachments = (msg.attachments ?? []).map((att) =>
-      this.cache.descriptorFor(att)
+      cache.descriptorFor(att)
     );
 
     const entry: LogEntry = {
@@ -93,20 +56,20 @@ export class Logger {
       channelId,
       guildId: gid,
       authorId: msg.author?.id,
-      authorName: this.authorName(msg),
+      authorName: authorName(msg),
       content: msg.content ?? "",
       sentAt: msg.timestamp ? Date.parse(msg.timestamp) : undefined,
       loggedAt: Date.now(),
       attachments,
     };
-    await this.store.append(entry);
+    await store.append(entry);
 
     // Race the CDN: try to grab bytes before the deleted URL 404s.
-    if (this.settings.cacheAttachments) {
+    if (settings.cacheAttachments) {
       for (const raw of msg.attachments ?? []) {
-        this.cache.capture(messageId, raw).then((path) => {
+        cache.capture(messageId, raw).then((path) => {
           if (path) {
-            this.store.updateAttachment(channelId, messageId, raw.id, {
+            store.updateAttachment(channelId, messageId, raw.id, {
               localPath: path,
               cached: true,
             });
@@ -116,12 +79,12 @@ export class Logger {
     }
   }
 
-  private async onUpdate(message: RawMessage) {
-    if (!this.settings.logEdits) return;
+  async function onUpdate(message: RawMessage) {
+    if (!settings.logEdits) return;
     // MESSAGE_UPDATE fires for embeds too; only log real content changes.
     if (typeof message.content !== "string") return;
     const channelId = message.channel_id;
-    const gid = this.a.stores.getChannelGuildId(channelId);
+    const gid = a.stores.getChannelGuildId(channelId);
 
     const entry: LogEntry = {
       schema: 1,
@@ -130,24 +93,58 @@ export class Logger {
       channelId,
       guildId: gid,
       authorId: message.author?.id,
-      authorName: this.authorName(message),
+      authorName: authorName(message),
       content: message.content,
       sentAt: message.timestamp ? Date.parse(message.timestamp) : undefined,
       loggedAt: Date.now(),
       revisions: [{ content: message.content, at: Date.now() }],
       attachments: [],
     };
-    await this.store.append(entry);
+    await store.append(entry);
   }
 
-  private onCreate(message: RawMessage, channelId: string) {
-    if (!this.settings.cacheAttachments) return;
-    const gid =
-      message.guild_id ?? this.a.stores.getChannelGuildId(channelId);
-    if (!gid || !this.settings.watchedGuilds.includes(gid)) return;
+  function onCreate(message: RawMessage, channelId: string) {
+    if (!settings.cacheAttachments) return;
+    const gid = message.guild_id ?? a.stores.getChannelGuildId(channelId);
+    if (!gid || !settings.watchedGuilds.includes(gid)) return;
     // Proactive pre-cache; fire and forget.
     for (const raw of message.attachments ?? []) {
-      this.cache.capture(message.id, raw);
+      cache.capture(message.id, raw);
     }
   }
+
+  return {
+    start() {
+      unpatch = a.patcher.onDispatch((action) => {
+        const p = a.normalize(action);
+        if (!p) return;
+        switch (p.type) {
+          case "MESSAGE_DELETE":
+            onDelete(p.channelId, p.id, p.guildId);
+            if (settings.keepInChat && settings.logDeletes) return false;
+            break;
+          case "MESSAGE_DELETE_BULK":
+            for (const id of p.ids) onDelete(p.channelId, id, p.guildId);
+            if (settings.keepInChat && settings.logDeletes) return false;
+            break;
+          case "MESSAGE_UPDATE":
+            onUpdate(p.message);
+            break;
+          case "MESSAGE_CREATE":
+            onCreate(p.message, p.channelId);
+            break;
+        }
+      });
+    },
+
+    stop() {
+      unpatch?.();
+      unpatch = null;
+      store.flush();
+    },
+
+    updateSettings(s) {
+      settings = s;
+    },
+  };
 }
