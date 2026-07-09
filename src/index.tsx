@@ -1,80 +1,149 @@
 /**
- * Plugin entry point.
+ * MessageLoggerRevenge — MINIMAL build.
  *
- * This is the ONLY place platform choice is made: import the Classic adapter,
- * build the core against its interface, and expose the Vendetta lifecycle
- * hooks. To move to Next, swap the one import below for ./adapter/next.
+ * Deliberately modeled almost verbatim on redstonekasi's "Message Logger",
+ * which is confirmed to load and run with working settings on this Revenge
+ * build. Goal for this version: prove the plugin loads, keeps deleted messages
+ * visible, and shows a working settings screen. Persistence, the log viewer,
+ * attachment caching, and edit logging come AFTER this loads cleanly.
+ *
+ * Key structural choices copied from the working reference:
+ *  - runtime reached via @vendetta/* imports (build maps them to vendetta.*).
+ *  - settings built from Discord's Forms components (NOT raw ReactNative).
+ *  - instance exported directly on module.exports (settings/onUnload as direct
+ *    properties), which is the shape the loader consumes.
+ *  - deletion kept visible by converting MESSAGE_DELETE -> MESSAGE_UPDATE with a
+ *    flag, propagating the flag through MessageRecord creation, and restyling
+ *    the row via a RowManager.generate patch.
  */
 
-import { adapter } from "./adapter/classic";
-import { createLogger, LoggerSettings } from "./core/logger";
-import { createLogStore } from "./core/store";
-import { createAttachmentCache } from "./core/cache";
-import { makeLogViewer } from "./ui/LogViewer";
-import { makeSettings } from "./ui/Settings";
+import { findByProps, findByName } from "@vendetta/metro";
+import { React, ReactNative, FluxDispatcher } from "@vendetta/metro/common";
+import { before, after, instead } from "@vendetta/patcher";
+import { storage } from "@vendetta/plugin";
+import { useProxy } from "@vendetta/storage";
+import { Forms } from "@vendetta/ui/components";
+import { getAssetIDByName } from "@vendetta/ui/assets";
 
-const SETTINGS_KEY = "settings";
+const { FormSwitchRow, FormIcon } = Forms;
 
-const DEFAULT_SETTINGS: LoggerSettings = {
-  logDeletes: true,
-  logEdits: true,
-  keepInChat: false,
-  watchedGuilds: [],
-  cacheAttachments: true,
-};
+// Default settings.
+storage.keepDeleted ??= true;
 
-// ---- wiring ----------------------------------------------------------------
+// ---- settings screen (Forms components, like the reference) ----------------
 
-const store = createLogStore(adapter);
-const cache = createAttachmentCache(adapter, {
-  maxBytes: 512 * 1024 * 1024, // 512 MB LRU ceiling; tune per device
-  maxFileBytes: 64 * 1024 * 1024, // skip anything over 64 MB
-});
-
-function loadSettings(): LoggerSettings {
-  return adapter.kv.get<LoggerSettings>(SETTINGS_KEY, DEFAULT_SETTINGS);
+function Settings() {
+  useProxy(storage);
+  return React.createElement(
+    ReactNative.ScrollView,
+    null,
+    React.createElement(FormSwitchRow, {
+      label: "Keep deleted messages visible",
+      subLabel: "Show deleted messages in red instead of removing them",
+      leading: React.createElement(FormIcon, {
+        source: getAssetIDByName("ic_message_delete"),
+      }),
+      onValueChange: (v: boolean) => {
+        storage.keepDeleted = v;
+      },
+      value: storage.keepDeleted,
+    })
+  );
 }
-function saveSettings(s: LoggerSettings) {
-  adapter.kv.set(SETTINGS_KEY, s);
-  logger.updateSettings(s);
+
+// ---- deletion-keeping mechanism (mirrors the reference) --------------------
+
+const patches: Array<() => void> = [];
+
+function onLoad() {
+  const messages = findByProps("_channelMessages");
+  const recordFuncs = findByProps("updateMessageRecord", "createMessageRecord");
+  const MessageRecord = findByName("MessageRecord", false);
+  const RowManager = findByName("RowManager");
+
+  // 1) Intercept deletes: turn into an update flagged as deleted, so the row
+  //    stays instead of being removed.
+  patches.push(
+    before("dispatch", FluxDispatcher, ([event]: any[]) => {
+      if (event.type !== "MESSAGE_DELETE") return;
+      if (!storage.keepDeleted) return;
+      if (event.__mlr_cleanup) return event; // our own real delete on unload
+      const msg = messages?.get(event.channelId)?.get(event.id);
+      if (!msg || msg.author?.id == "1" || msg.state == "SEND_FAILED") return event;
+      return [
+        {
+          message: { ...msg.toJS(), __mlr_deleted: true },
+          type: "MESSAGE_UPDATE",
+        },
+      ];
+    })
+  );
+
+  // 2) Propagate the flag through Discord's message-record creation so it
+  //    survives re-renders.
+  if (recordFuncs) {
+    patches.push(
+      instead("updateMessageRecord", recordFuncs, function (
+        this: any,
+        [oldRecord, newRecord]: any[],
+        orig: (...a: any[]) => any
+      ) {
+        return newRecord.__mlr_deleted
+          ? recordFuncs.createMessageRecord(newRecord, oldRecord.reactions)
+          : orig.apply(this, [oldRecord, newRecord]);
+      })
+    );
+    patches.push(
+      after("createMessageRecord", recordFuncs, ([input]: any[], output: any) => {
+        output.__mlr_deleted = input.__mlr_deleted;
+      })
+    );
+  }
+  if (MessageRecord) {
+    patches.push(
+      after("default", MessageRecord, ([input]: any[], output: any) => {
+        output.__mlr_deleted = !!input.__mlr_deleted;
+      })
+    );
+  }
+
+  // 3) Restyle deleted rows red.
+  if (RowManager?.prototype) {
+    patches.push(
+      after("generate", RowManager.prototype, ([data]: any[], row: any) => {
+        if (data.rowType === 1 && data.message?.__mlr_deleted) {
+          row.message.edited = "deleted";
+          row.backgroundHighlight ??= {};
+          row.backgroundHighlight.backgroundColor =
+            ReactNative.processColor("#da373c22");
+          row.backgroundHighlight.gutterColor =
+            ReactNative.processColor("#da373cff");
+        }
+      })
+    );
+  }
 }
 
-const logger = createLogger(adapter, store, cache, loadSettings());
-
-const LogViewer = makeLogViewer(adapter, store, cache);
-const openViewer = () => adapter.nav.pushScreen("Message Log", LogViewer);
-
-const Settings = makeSettings(adapter, loadSettings, saveSettings, openViewer);
-
-// ---- Vendetta lifecycle ----------------------------------------------------
-
-// The Revenge/Vendetta loader reads a plugin's DEFAULT export as the instance:
-// an object with onLoad/onUnload (and optional settings). Named exports don't
-// register — the loader finds no instance, which is why the toggle/settings go
-// inert. So everything the client calls lives on this one default-exported object.
-export default {
-  onLoad() {
-    logger.start();
-    // Diagnostic: surface whether the runtime modules resolved, via channels
-    // that work even if the settings screen doesn't — a toast and the debug log.
-    try {
-      adapter
-        .diagnose()
-        .then((d) => {
-          const summary = d.fileModuleMethods[0] ?? "(no summary)";
-          adapter.ui.showToast(`MLR loaded — ${summary}`);
-          console.log("[MessageLoggerRevenge] diagnose:", JSON.stringify(d));
-        })
-        .catch((e) => {
-          console.log("[MessageLoggerRevenge] diagnose failed:", String(e));
-        });
-    } catch (e) {
-      console.log("[MessageLoggerRevenge] onLoad diagnostic error:", String(e));
+function onUnload() {
+  patches.forEach((u) => u());
+  patches.length = 0;
+  // Clean up: actually delete anything we were keeping visible.
+  const messages = findByProps("_channelMessages");
+  if (messages?._channelMessages) {
+    for (const ch in messages._channelMessages) {
+      for (const e of messages._channelMessages[ch]._array ?? []) {
+        if (e.__mlr_deleted) {
+          FluxDispatcher.dispatch({
+            type: "MESSAGE_DELETE",
+            id: e.id,
+            channelId: e.channel_id,
+            __mlr_cleanup: true,
+          });
+        }
+      }
     }
-  },
-  onUnload() {
-    logger.stop();
-  },
-  // Rendered on the plugin's settings page.
-  settings: Settings,
-};
+  }
+}
+
+// Export the instance directly (matches the reference's returned-instance shape).
+module.exports = { onLoad, onUnload, settings: Settings };
